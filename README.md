@@ -38,11 +38,11 @@ Here is an example of a user retrieval in a caching layer:
 ```go
 import "github.com/samber/go-singleflightx"
 
-func GetUsersByID(keys []string) (map[string]User, error) {
+func getUsersByID(userIDs []string) (map[string]User, error) {
     users := []User{}
 
     // 📍 SQL query here...
-    err := sqlx.Select(&users, "SELECT * FROM users WHERE id IN (?);", keys...)
+    err := sqlx.Select(&users, "SELECT * FROM users WHERE id IN (?);", userIDs...)
     if err != nil {
         return nil, err
     }
@@ -55,19 +55,27 @@ func GetUsersByID(keys []string) (map[string]User, error) {
     return results, nil
 }
 
-var g singleflightx.Group[string, User]
+func main() {
+    var g singleflightx.Group[string, User]
 
-// 👇 concurrent queries will be dedup
+    // 👇 concurrent queries will be dedup
+    output := g.DoX([]string{"user-1", "user-2"}, getUsersByID)
+}
+```
 
-output := g.DoX([]string{"user-1", "user-2"}, GetUsersByID) 
+`output` map is of type `map[K]singleflightx.Result[V]`, and will have 2 entries, whatever the result of callback.
 
-// 👆 `output` map is of type map[K]singleflightx.Result[V], and will have 2 entries, whatever the result of callback.
-// 
-// type Result[V any] struct {
-//   	 Value  singleflightx.NullValue[V]  // 💡 A result is considered as "null" if callback did not return it.
-//   	 Err    error
-//   	 Shared bool
-// }
+```go
+type Result[V any] struct {
+  	 Value  singleflightx.NullValue[V]  // 💡 A result is considered as "null" if the callback did not return it.
+  	 Err    error
+  	 Shared bool
+}
+
+type NullValue[V any] struct {
+	Value V
+	Valid bool
+}
 ```
 
 ## 🤝 Contributing
