@@ -16,7 +16,7 @@
 
 This library is inspired by `x/sync/singleflight` but adds many features:
 - 🧬 generics
-- 🍱 batching (mix of in-flight and new requests)
+- 🍱 batching: fetch multiple keys in a single callback, with in-flight deduplication
 - 📭 nullable result
 
 ## 🚀 Install
