@@ -63,7 +63,7 @@ func main() {
 }
 ```
 
-`output` map is of type `map[K]singleflightx.Result[V]`, and will have 2 entries, whatever the result of callback.
+`output` is of type `map[K]singleflightx.Result[V]`, and will have always as many entries as requested, whatever the result of callback.
 
 ```go
 type Result[V any] struct {
