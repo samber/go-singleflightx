@@ -171,3 +171,14 @@ func (g *Group[K, V]) doCallX(c map[K]*call[V], keys []K, fn func([]K) (map[K]V,
 		recovered = true
 	}
 }
+
+// ForgetX tells the singleflight to forget about many keys.  Future calls
+// to Do for this key will call the function rather than waiting for
+// an earlier call to complete.
+func (g *Group[K, V]) ForgetX(keys []K) {
+	g.mu.Lock()
+	for _, key := range keys {
+		delete(g.m, key)
+	}
+	g.mu.Unlock()
+}

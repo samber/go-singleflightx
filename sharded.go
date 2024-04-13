@@ -69,3 +69,24 @@ func (sg *ShardedGroup[K, V]) DoChanX(keys []K, fn func([]K) (map[K]V, error)) m
 
 	return results
 }
+
+// Forget tells the singleflight to forget about a key.  Future calls
+// to Do for this key will call the function rather than waiting for
+// an earlier call to complete.
+func (sg *ShardedGroup[K, V]) Forget(key K) {
+	i := sg.hasher.computeHash(key, sg.count)
+	sg.shards[i].Forget(key)
+}
+
+// ForgetX tells the singleflight to forget about many keys.  Future calls
+// to Do for this key will call the function rather than waiting for
+// an earlier call to complete.
+func (sg *ShardedGroup[K, V]) ForgetX(keys []K) {
+	keysByShard := partitionBy(keys, func(key K) uint {
+		return sg.hasher.computeHash(key, sg.count)
+	})
+
+	for i, keys := range keysByShard {
+		sg.shards[i].ForgetX(keys)
+	}
+}
