@@ -18,6 +18,7 @@ This library is inspired by `x/sync/singleflight` but adds many features:
 - 🧬 generics
 - 🍱 batching: fetch multiple keys in a single callback, with in-flight deduplication
 - 📭 nullable result
+- 🍕 sharded groups
 
 ## 🚀 Install
 
@@ -77,6 +78,20 @@ type NullValue[V any] struct {
 	Valid bool
 }
 ```
+
+### Sharded groups, for high contention/concurrency environments
+
+```go
+g := singleflightx.NewShardedGroup[K string, User](10, func (key string) uint {
+    h := fnv.New64a()
+    h.Write([]byte(key))
+    return uint(h.Sum64())
+})
+
+// as usual, but if the keys match different shards, GetUsersByID will be called twice
+output := g.DoX([]string{"user-1", "user-2"}, GetUsersByID) 
+```
+
 
 ## 🤝 Contributing
 
