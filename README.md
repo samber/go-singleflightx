@@ -64,11 +64,11 @@ func main() {
 }
 ```
 
-`output` is of type `map[K]singleflightx.Result[V]`, and will have always as many entries as requested, whatever the result of callback.
+`output` is of type `map[K]singleflightx.Result[V]`, and will always have as many entries as requested, whatever the callback result.
 
 ```go
 type Result[V any] struct {
-  	 Value  singleflightx.NullValue[V]  // 💡 A result is considered as "null" if the callback did not return it.
+  	 Value  singleflightx.NullValue[V]  // 💡 A result is considered "null" if the callback did not return it.
   	 Err    error
   	 Shared bool
 }
@@ -88,8 +88,8 @@ g := singleflightx.NewShardedGroup[K string, User](10, func (key string) uint {
     return uint(h.Sum64())
 })
 
-// as usual, but if the keys match different shards, GetUsersByID will be called twice
-output := g.DoX([]string{"user-1", "user-2"}, GetUsersByID) 
+// as usual, but if the keys match different shards, getUsersByID will be called twice
+output := g.DoX([]string{"user-1", "user-2"}, getUsersByID) 
 ```
 
 
