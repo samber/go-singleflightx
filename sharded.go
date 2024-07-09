@@ -5,7 +5,7 @@ func NewShardedGroup[K comparable, V any](count uint, hasher Hasher[K]) *Sharded
 	for i := range shards {
 		shards[i] = Group[K, V]{}
 	}
-	return &ShardedGroup[K, V]{count: count, shards: shards}
+	return &ShardedGroup[K, V]{count: count, shards: shards, hasher: hasher}
 }
 
 // ShardedGroup is a duplicate of singleflight.Group, but with the ability to shard the map of calls.
