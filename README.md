@@ -92,6 +92,37 @@ g := singleflightx.NewShardedGroup[K string, User](10, func (key string) uint {
 output := g.DoX([]string{"user-1", "user-2"}, getUsersByID) 
 ```
 
+### go-singleflightx + go-batchify
+
+`go-batchify` groups concurrent tasks into a single batch. By adding `go-singleflightx`, you will be able to dedupe
+
+```go
+import (
+    "golang.org/x/sync/singleflight"
+    "github.com/samber/go-batchify"
+)
+
+var group singleflight.Group
+
+batch := batchify.NewBatchWithTimer(
+    10,
+    func (ids []int) (map[int]string, error) {
+        return ..., nil
+    },
+    5*time.Millisecond,
+)
+
+http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+    idStr := r.URL.Query().Get("id")
+    id, _ := strconv.Atoi(idStr)
+
+    value, err, _ = group.Do(idStr, func() (interface{}, error) {
+        return batch.Do(id)
+    })
+
+    // ...
+})
+```
 
 ## 🤝 Contributing
 
