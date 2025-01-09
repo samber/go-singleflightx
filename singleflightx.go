@@ -7,7 +7,7 @@ import "runtime"
 // time. If a duplicate comes in, the duplicate caller waits for the
 // original to complete and receives the same results.
 // The return value shared indicates whether v was given to multiple callers.
-// Even if fn does not return v on some keys, the results map will contain
+// Even if fn does not return V on some keys, the results map will contain
 // those keys with a `Valid` field set to false.
 func (g *Group[K, V]) DoX(keys []K, fn func([]K) (map[K]V, error)) (results map[K]Result[V]) {
 	results = make(map[K]Result[V], len(keys))
