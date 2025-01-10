@@ -20,6 +20,8 @@ type ShardedGroup[K comparable, V any] struct {
 // time. If a duplicate comes in, the duplicate caller waits for the
 // original to complete and receives the same results.
 // The return value shared indicates whether v was given to multiple callers.
+// Even if fn does not return V on some keys, the results map will contain
+// those keys with a `Valid` field set to false.
 func (sg *ShardedGroup[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bool) {
 	i := sg.hasher.computeHash(key, sg.count)
 	return sg.shards[i].Do(key, fn)
