@@ -12,7 +12,7 @@
 
 > x/sync/singleflight but better
 
-## Features
+## ✨ Features
 
 This library is inspired by `x/sync/singleflight` but adds many features:
 - 🧬 generics: type-safe API, no `interface{}` boxing overhead
@@ -20,7 +20,7 @@ This library is inspired by `x/sync/singleflight` but adds many features:
 - 📭 nullable result
 - 🍕 sharded groups
 
-## Performance
+### Performance
 
 `x/sync/singleflight` uses `any` (aka `interface{}`) for return values, which means every value must be boxed into an interface on write and type-asserted on read. For value types (structs, ints, etc.), boxing triggers a heap allocation and increases GC pressure — an unnecessary cost in high-throughput or high-concurrency paths.
 
@@ -38,7 +38,7 @@ This library is v0 and follows SemVer strictly. No breaking changes will be made
 
 GoDoc: [https://pkg.go.dev/github.com/samber/go-singleflightx](https://pkg.go.dev/github.com/samber/go-singleflightx)
 
-## Examples
+## 🔥 Examples
 
 Here is an example of a user retrieval in a caching layer:
 
