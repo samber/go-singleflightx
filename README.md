@@ -15,10 +15,16 @@
 ## Features
 
 This library is inspired by `x/sync/singleflight` but adds many features:
-- 🧬 generics
+- 🧬 generics: type-safe API, no `interface{}` boxing overhead
 - 🍱 batching: fetch multiple keys in a single callback, with in-flight deduplication
 - 📭 nullable result
 - 🍕 sharded groups
+
+## Performance
+
+`x/sync/singleflight` uses `any` (aka `interface{}`) for return values, which means every value must be boxed into an interface on write and type-asserted on read. For value types (structs, ints, etc.), boxing triggers a heap allocation and increases GC pressure — an unnecessary cost in high-throughput or high-concurrency paths.
+
+`go-singleflightx` uses **Go generics** so values are stored and returned as their concrete types, eliminating interface boxing and the associated allocations entirely.
 
 ## 🚀 Install
 
