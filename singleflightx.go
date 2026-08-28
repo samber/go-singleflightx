@@ -21,10 +21,11 @@ func (g *Group[K, V]) DoX(keys []K, fn func([]K) (map[K]V, error)) (results map[
 	for _, k := range keys {
 		if c, ok := g.m[k]; ok {
 			c.dups++
+			c.join()
 			calls[k] = c
 		} else {
-			c := new(call[V])
-			c.wg.Add(1)
+			c := &call[V]{done: make(chan struct{})}
+			c.join()
 			g.m[k] = c
 			calls[k] = c
 			toCall = append(toCall, k)
@@ -35,7 +36,7 @@ func (g *Group[K, V]) DoX(keys []K, fn func([]K) (map[K]V, error)) (results map[
 	g.doCallX(calls, toCall, fn)
 
 	for k, c := range calls {
-		c.wg.Wait()
+		<-c.done
 
 		if e, ok := c.err.(*panicError); ok {
 			panic(e)
@@ -69,11 +70,12 @@ func (g *Group[K, V]) DoChanX(keys []K, fn func([]K) (map[K]V, error)) map[K]cha
 	for _, k := range keys {
 		if c, ok := g.m[k]; ok {
 			c.dups++
+			c.join()
 			c.chans = append(g.m[k].chans, results[k])
 			calls[k] = c
 		} else {
-			c := &call[V]{chans: []chan<- Result[V]{results[k]}}
-			c.wg.Add(1)
+			c := &call[V]{done: make(chan struct{}), chans: []chan<- Result[V]{results[k]}}
+			c.join()
 			g.m[k] = c
 			calls[k] = c
 			toCall = append(toCall, k)
@@ -109,12 +111,21 @@ func (g *Group[K, V]) doCallX(c map[K]*call[V], keys []K, fn func([]K) (map[K]V,
 		defer g.mu.Unlock()
 
 		for _, key := range keys {
-			c[key].wg.Done()
+			close(c[key].done)
 			if g.m[key] == c[key] {
 				delete(g.m, key)
 			}
+		}
 
-			if e, ok := c[key].err.(*panicError); ok {
+		// Every key in this batch shares the same callCtx (or none), created
+		// once by the caller before doCallX was launched.
+		cc := c[keys[0]].cc
+		if cc != nil {
+			cc.cancel(nil)
+		}
+
+		for _, key := range keys {
+			if e, ok := c[key].err.(*panicError); ok && cc == nil {
 				// In order to prevent the waiting channels from being blocked forever,
 				// needs to ensure that this panic cannot be recovered.
 				if len(c[key].chans) > 0 {
@@ -126,7 +137,10 @@ func (g *Group[K, V]) doCallX(c map[K]*call[V], keys []K, fn func([]K) (map[K]V,
 			} else if c[key].err == errGoexit {
 				// Already in the process of goexit, no need to call again
 			} else {
-				// Normal return
+				// Normal return, or a context-aware call's panic (cc != nil):
+				// delivered as a plain Result instead of crashing the process, so
+				// DoXContext callers can re-panic themselves and DoChanXContext
+				// callers see it in Result.Err.
 				for _, ch := range c[key].chans {
 					ch <- Result[V]{NullValue[V]{c[key].value, !c[key].absent}, c[key].err, c[key].dups > 0}
 				}

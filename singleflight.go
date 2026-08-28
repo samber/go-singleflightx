@@ -46,23 +46,6 @@ func newPanicError(v interface{}) error {
 	return &panicError{value: v, stack: stack}
 }
 
-// call is an in-flight or completed singleflight.Do call
-type call[V any] struct {
-	wg sync.WaitGroup
-
-	// These fields are written once before the WaitGroup is done
-	// and are only read after the WaitGroup is done.
-	value  V
-	absent bool
-	err    error
-
-	// These fields are read and written with the singleflight
-	// mutex held before the WaitGroup is done, and are read but
-	// not written after the WaitGroup is done.
-	dups  int
-	chans []chan<- Result[V]
-}
-
 // Group represents a class of work and forms a namespace in
 // which units of work can be executed with duplicate suppression.
 type Group[K comparable, V any] struct {
@@ -96,8 +79,9 @@ func (g *Group[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bo
 	}
 	if c, ok := g.m[key]; ok {
 		c.dups++
+		c.join()
 		g.mu.Unlock()
-		c.wg.Wait()
+		<-c.done
 
 		if e, ok := c.err.(*panicError); ok {
 			panic(e)
@@ -106,8 +90,8 @@ func (g *Group[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bo
 		}
 		return c.value, c.err, true
 	}
-	c := new(call[V])
-	c.wg.Add(1)
+	c := &call[V]{done: make(chan struct{})}
+	c.join()
 	g.m[key] = c
 	g.mu.Unlock()
 
@@ -127,12 +111,13 @@ func (g *Group[K, V]) DoChan(key K, fn func() (V, error)) <-chan Result[V] {
 	}
 	if c, ok := g.m[key]; ok {
 		c.dups++
+		c.join()
 		c.chans = append(c.chans, ch)
 		g.mu.Unlock()
 		return ch
 	}
-	c := &call[V]{chans: []chan<- Result[V]{ch}}
-	c.wg.Add(1)
+	c := &call[V]{done: make(chan struct{}), chans: []chan<- Result[V]{ch}}
+	c.join()
 	g.m[key] = c
 	g.mu.Unlock()
 
@@ -156,12 +141,15 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 
 		g.mu.Lock()
 		defer g.mu.Unlock()
-		c.wg.Done()
+		close(c.done)
 		if g.m[key] == c {
 			delete(g.m, key)
 		}
+		if c.cc != nil {
+			c.cc.cancel(nil)
+		}
 
-		if e, ok := c.err.(*panicError); ok {
+		if e, ok := c.err.(*panicError); ok && c.cc == nil {
 			// In order to prevent the waiting channels from being blocked forever,
 			// needs to ensure that this panic cannot be recovered.
 			if len(c.chans) > 0 {
@@ -173,7 +161,10 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 		} else if c.err == errGoexit {
 			// Already in the process of goexit, no need to call again
 		} else {
-			// Normal return
+			// Normal return, or a context-aware call's panic (c.cc != nil):
+			// delivered as a plain Result instead of crashing the process, so
+			// DoContext/DoXContext callers can re-panic themselves and
+			// DoChanContext/DoChanXContext callers see it in Result.Err.
 			for _, ch := range c.chans {
 				ch <- Result[V]{NullValue[V]{c.value, !c.absent}, c.err, c.dups > 0}
 			}
