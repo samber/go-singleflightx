@@ -228,6 +228,24 @@ func TestDoContextPanicAbsorbedWhenAllCallersLeave(t *testing.T) {
 	// this point proves it was absorbed instead.
 }
 
+// A panic delivered as a Result through DoChanContext must not report a
+// Valid zero value: fn never got to produce one.
+func TestPanicDoChanContextValueNotValid(t *testing.T) {
+	var g Group[string, int]
+
+	ch := g.DoChanContext(context.Background(), "key", func(ctx context.Context) (int, error) {
+		panic("boom")
+	})
+
+	res := <-ch
+	if res.Value.Valid {
+		t.Errorf("a panicked call should not report a Valid zero value: %+v", res)
+	}
+	if res.Err == nil {
+		t.Error("expected a non-nil Err")
+	}
+}
+
 func TestGoexitDoContext(t *testing.T) {
 	var g Group[string, *string]
 	fn := func(ctx context.Context) (*string, error) {

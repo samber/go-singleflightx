@@ -68,6 +68,57 @@ func TestDoChanXContext(t *testing.T) {
 	}
 }
 
+// A key repeated 3+ times in one DoChanXContext call used to register the
+// same capacity-1 result channel more than once, so the second send would
+// block forever once the caller had already drained the first value --
+// while Group.mu was held, wedging every other call on the Group. Mirrors
+// TestDoChanXDuplicateKeyDoesNotDeadlockGroup, but through the context variant.
+func TestDoChanXContextDuplicateKeyDoesNotDeadlockGroup(t *testing.T) {
+	var g Group[string, int]
+
+	chans := g.DoChanXContext(context.Background(), []string{"a", "a", "a"}, func(ctx context.Context, keys []string) (map[string]int, error) {
+		return map[string]int{"a": 1}, nil
+	})
+	if len(chans) != 1 {
+		t.Fatalf("len(chans) = %d; want 1", len(chans))
+	}
+
+	res := <-chans["a"]
+	if res.Value.Value != 1 || !res.Value.Valid {
+		t.Errorf("unexpected result: %+v", res)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.Do("unrelated", func() (int, error) { return 2, nil }) //nolint:errcheck
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Group.mu is wedged: an unrelated Do never returned")
+	}
+}
+
+// A panic delivered as a Result through DoChanXContext must not report a
+// Valid zero value: fn never got to produce one.
+func TestPanicDoChanXContextValueNotValid(t *testing.T) {
+	var g Group[string, int]
+
+	chans := g.DoChanXContext(context.Background(), []string{"key"}, func(ctx context.Context, keys []string) (map[string]int, error) {
+		panic("boom")
+	})
+
+	res := <-chans["key"]
+	if res.Value.Valid {
+		t.Errorf("a panicked call should not report a Valid zero value: %+v", res)
+	}
+	if res.Err == nil {
+		t.Error("expected a non-nil Err")
+	}
+}
+
 func TestDoXContextAlreadyCanceled(t *testing.T) {
 	var g Group[string, int]
 

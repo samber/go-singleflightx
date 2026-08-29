@@ -38,6 +38,7 @@ func (g *Group[K, V]) DoXContext(ctx context.Context, keys []K, fn func(context.
 // whether joining or creating — shared by DoXContext (chans == nil) and
 // DoChanXContext.
 func (g *Group[K, V]) startOrJoinContextX(ctx context.Context, keys []K, chans map[K]chan Result[V]) (calls map[K]*call[V], toCall []K) {
+	keys = uniqKeys(keys)
 	calls = make(map[K]*call[V], len(keys))
 
 	g.mu.Lock()

@@ -183,6 +183,11 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 				// panic has been discarded.
 				if r := recover(); r != nil {
 					c.err = newPanicError(r)
+					// A context-aware call delivers this as a Result instead of
+					// crashing the process (see the finalize defer below), so
+					// absent must be set here too, or Valid would wrongly report
+					// true for the zero value fn never got to produce.
+					c.absent = true
 				}
 			}
 		}()
