@@ -2,7 +2,7 @@
 # go-singleflightx
 
 [![tag](https://img.shields.io/github/tag/samber/go-singleflightx.svg)](https://github.com/samber/go-singleflightx/releases)
-![Go Version](https://img.shields.io/badge/Go-%3E%3D%201.18.0-%23007d9c)
+![Go Version](https://img.shields.io/badge/Go-%3E%3D%201.21.0-%23007d9c)
 [![GoDoc](https://godoc.org/github.com/samber/go-singleflightx?status.svg)](https://pkg.go.dev/github.com/samber/go-singleflightx)
 ![Build Status](https://github.com/samber/go-singleflightx/actions/workflows/test.yml/badge.svg)
 [![Go report](https://goreportcard.com/badge/github.com/samber/go-singleflightx)](https://goreportcard.com/report/github.com/samber/go-singleflightx)
@@ -19,6 +19,7 @@ This library is inspired by `x/sync/singleflight` but adds many features:
 - 🍱 batching: fetch multiple keys in a single callback, with in-flight deduplication
 - 📭 nullable result
 - 🍕 sharded groups
+- ⏱️ per-caller timeout/cancellation, without interrupting other callers sharing the same call
 
 ### Performance
 
@@ -83,6 +84,36 @@ type NullValue[V any] struct {
 	Value V
 	Valid bool
 }
+```
+
+### Per-caller timeout, with `DoContext` / `DoXContext`
+
+`DoContext`, `DoChanContext`, `DoXContext` and `DoChanXContext` accept a `context.Context` that bounds **only the calling goroutine's wait** — not the shared callback. If a caller's context is done before the callback returns, that caller gets the context's error immediately; every other caller attached to the same key keeps waiting for the real result, and the callback keeps running for them.
+
+The callback's own context is only canceled once **every** caller of that key has stopped waiting for it (a plain, non-context `Do`/`DoX` caller never leaves early, so it always keeps the callback running for as long as it is attached).
+
+```go
+var g singleflightx.Group[string, User]
+
+ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+defer cancel()
+
+// If ctx expires, this call returns ctx.Err() right away, but the callback
+// keeps running in case another caller is still waiting on "user-1".
+user, err, shared := g.DoContext(ctx, "user-1", func(ctx context.Context) (User, error) {
+    // 📍 SQL query here...
+    var user User
+    err := sqlx.GetContext(ctx, &user, "SELECT * FROM users WHERE id = ?;", "user-1")
+    return user, err
+})
+```
+
+```go
+// Same bound, applied per key: a key already resolved keeps its real
+// result even if ctx expires before the whole batch completes.
+output := g.DoXContext(ctx, []string{"user-1", "user-2"}, func(ctx context.Context, userIDs []string) (map[string]User, error) {
+    return getUsersByID(userIDs)
+})
 ```
 
 ### Sharded groups, for high contention/concurrency environments
