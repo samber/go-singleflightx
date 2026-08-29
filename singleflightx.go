@@ -10,6 +10,7 @@ import "runtime"
 // Even if fn does not return V on some keys, the results map will contain
 // those keys with a `Valid` field set to false.
 func (g *Group[K, V]) DoX(keys []K, fn func([]K) (map[K]V, error)) (results map[K]Result[V]) {
+	keys = uniqKeys(keys)
 	results = make(map[K]Result[V], len(keys))
 	calls := make(map[K]*call[V], len(keys))
 	toCall := []K{}
@@ -55,6 +56,7 @@ func (g *Group[K, V]) DoX(keys []K, fn func([]K) (map[K]V, error)) (results map[
 //
 // The returned channel will not be closed.
 func (g *Group[K, V]) DoChanX(keys []K, fn func([]K) (map[K]V, error)) map[K]chan Result[V] {
+	keys = uniqKeys(keys)
 	results := make(map[K]chan Result[V], len(keys))
 	for _, k := range keys {
 		results[k] = make(chan Result[V], 1)
@@ -159,8 +161,13 @@ func (g *Group[K, V]) doCallX(c map[K]*call[V], keys []K, fn func([]K) (map[K]V,
 				// the time we know that, the part of the stack trace relevant to the
 				// panic has been discarded.
 				if r := recover(); r != nil {
+					// A context-aware batch delivers this as a Result instead of
+					// crashing the process (see the finalize defer below), so
+					// absent must be set here too, or Valid would wrongly report
+					// true for the zero value fn never got to produce.
 					for _, key := range keys {
 						c[key].err = newPanicError(r)
+						c[key].absent = true
 					}
 				}
 			}

@@ -186,6 +186,35 @@ func TestDoChanX(t *testing.T) {
 	assert.Len(t, g.m, 0)
 }
 
+// A key repeated 3+ times in one DoChanX call used to register the same
+// capacity-1 result channel more than once, so the second send would block
+// forever once the caller had already drained the first value -- while
+// Group.mu was held, wedging every other call on the Group.
+func TestDoChanXDuplicateKeyDoesNotDeadlockGroup(t *testing.T) {
+	var g Group[string, int]
+
+	chans := g.DoChanX([]string{"a", "a", "a"}, func(keys []string) (map[string]int, error) {
+		return map[string]int{"a": 1}, nil
+	})
+	assert.Len(t, chans, 1)
+
+	res := <-chans["a"]
+	assert.Equal(t, 1, res.Value.Value)
+	assert.True(t, res.Value.Valid)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.Do("unrelated", func() (int, error) { return 2, nil }) //nolint:errcheck
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Group.mu is wedged: an unrelated Do never returned")
+	}
+}
+
 // Test singleflight behaves correctly after Do panic.
 // See https://github.com/golang/go/issues/41133
 func TestPanicDoX(t *testing.T) {
