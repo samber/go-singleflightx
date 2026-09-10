@@ -78,7 +78,6 @@ func (g *Group[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bo
 		g.m = make(map[K]*call[V])
 	}
 	if c, ok := g.m[key]; ok {
-		c.dups++
 		c.join()
 		g.mu.Unlock()
 		<-c.done
@@ -88,7 +87,10 @@ func (g *Group[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bo
 		} else if c.err == errGoexit {
 			runtime.Goexit()
 		}
-		return c.value, c.err, true
+		// waiters > 1, not just > 0: this caller is itself still counted in
+		// waiters (it hasn't detached), so >1 asks whether anyone *else* is
+		// also currently attached to have received this same value.
+		return c.value, c.err, c.waiters > 1
 	}
 	c := &call[V]{done: make(chan struct{})}
 	c.join()
@@ -96,7 +98,7 @@ func (g *Group[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bo
 	g.mu.Unlock()
 
 	g.doCall(c, key, fn)
-	return c.value, c.err, c.dups > 0
+	return c.value, c.err, c.waiters > 1
 }
 
 // DoChan is like Do but returns a channel that will receive the
@@ -110,13 +112,13 @@ func (g *Group[K, V]) DoChan(key K, fn func() (V, error)) <-chan Result[V] {
 		g.m = make(map[K]*call[V])
 	}
 	if c, ok := g.m[key]; ok {
-		c.dups++
 		c.join()
 		c.chans = append(c.chans, ch)
+		c.hasPlainChan = true
 		g.mu.Unlock()
 		return ch
 	}
-	c := &call[V]{done: make(chan struct{}), chans: []chan<- Result[V]{ch}}
+	c := &call[V]{done: make(chan struct{}), chans: []chan<- Result[V]{ch}, hasPlainChan: true}
 	c.join()
 	g.m[key] = c
 	g.mu.Unlock()
@@ -137,6 +139,12 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 		// the given function invoked runtime.Goexit
 		if !normalReturn && !recovered {
 			c.err = errGoexit
+			// A pure context-aware call delivers this as a Result instead
+			// of leaving a DoChanContext caller blocked forever (see the
+			// finalize defer below), so absent must be set here too, or
+			// Valid would wrongly report true for the zero value fn never
+			// got to produce.
+			c.absent = true
 		}
 
 		g.mu.Lock()
@@ -149,7 +157,15 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 			c.cc.cancel(nil)
 		}
 
-		if e, ok := c.err.(*panicError); ok && c.cc == nil {
+		// A plain (non-context) channel caller has no per-caller way to
+		// re-raise a panic or Goexit the way Do/DoContext callers do via
+		// take() — it can only ever see what we push into its channel — so
+		// if one is attached, its contract (crash the process on panic,
+		// hang on Goexit exactly as it always has) wins even if this call
+		// was started by a XxxContext variant.
+		mustHonorPlainContract := c.cc == nil || c.hasPlainChan
+
+		if e, ok := c.err.(*panicError); ok && mustHonorPlainContract {
 			// In order to prevent the waiting channels from being blocked forever,
 			// needs to ensure that this panic cannot be recovered.
 			if len(c.chans) > 0 {
@@ -158,15 +174,16 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 			} else {
 				panic(e)
 			}
-		} else if c.err == errGoexit {
+		} else if c.err == errGoexit && mustHonorPlainContract {
 			// Already in the process of goexit, no need to call again
 		} else {
-			// Normal return, or a context-aware call's panic (c.cc != nil):
-			// delivered as a plain Result instead of crashing the process, so
-			// DoContext/DoXContext callers can re-panic themselves and
-			// DoChanContext/DoChanXContext callers see it in Result.Err.
+			// Normal return, or a pure context-aware call's panic/Goexit
+			// (c.cc != nil and no plain channel caller ever attached):
+			// delivered as a plain Result instead of crashing the process or
+			// hanging, so a DoContext caller can re-panic/re-Goexit itself
+			// and a DoChanContext caller sees it in Result.Err.
 			for _, ch := range c.chans {
-				ch <- Result[V]{NullValue[V]{c.value, !c.absent}, c.err, c.dups > 0}
+				ch <- Result[V]{NullValue[V]{c.value, !c.absent}, c.err, c.waiters > 1}
 			}
 		}
 	}()

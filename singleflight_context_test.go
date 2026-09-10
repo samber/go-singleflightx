@@ -1,9 +1,13 @@
 package singleflightx
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -159,8 +163,7 @@ func TestDoContextNewCallAfterFullCancel(t *testing.T) {
 	close(firstUnblock)
 }
 
-// A panic in fn is re-raised by every caller still attached when it
-// occurs — mirrors TestPanicDo, but through DoContext.
+// A panic in fn is re-raised by every caller still attached when it occurs.
 func TestPanicDoContext(t *testing.T) {
 	var g Group[string, int]
 	fn := func(ctx context.Context) (int, error) {
@@ -423,4 +426,128 @@ func TestDoContextFnCtxInheritsValuesNotDeadline(t *testing.T) {
 
 	close(unblockFn)
 	<-joinerDone
+}
+
+// A plain DoChan has no per-caller way to re-raise a panic (unlike Do,
+// DoContext or DoXContext, which all re-panic via take()): it can only ever
+// see what doCall pushes into its channel, so if it joins a call created by
+// DoContext, that call's panic must still crash the process instead of
+// being silently delivered as a Result.
+func TestPanicDoContextSharedByDoChanStillCrashes(t *testing.T) {
+	if os.Getenv("TEST_PANIC_DOCONTEXT_SHARED_BY_DOCHAN") != "" {
+		blocked := make(chan struct{})
+		unblock := make(chan struct{})
+
+		g := new(Group[string, int])
+		go func() {
+			defer func() {
+				recover() //nolint:errcheck
+			}()
+			g.DoContext(context.Background(), "", func(ctx context.Context) (int, error) { //nolint:errcheck
+				close(blocked)
+				<-unblock
+				panic("Panicking in DoContext")
+			})
+		}()
+
+		<-blocked
+		ch := g.DoChan("", func() (int, error) {
+			panic("DoChan unexpectedly executed callback")
+		})
+		close(unblock)
+		<-ch
+		t.Fatalf("DoChan unexpectedly returned")
+	}
+
+	t.Parallel()
+
+	cmd := exec.Command(executable(t), "-test.run="+t.Name(), "-test.v")
+	cmd.Env = append(os.Environ(), "TEST_PANIC_DOCONTEXT_SHARED_BY_DOCHAN=1")
+	out := new(bytes.Buffer)
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := cmd.Wait()
+	t.Logf("%s:\n%s", strings.Join(cmd.Args, " "), out)
+	if err == nil {
+		t.Errorf("Test subprocess passed; want a crash due to panic in DoContext")
+	}
+	if bytes.Contains(out.Bytes(), []byte("DoChan unexpectedly")) {
+		t.Errorf("Test subprocess failed with an unexpected failure mode: a plain DoChan joining a DoContext-created call silently absorbed the panic instead of crashing")
+	}
+	if !bytes.Contains(out.Bytes(), []byte("Panicking in DoContext")) {
+		t.Errorf("Test subprocess failed, but the crash isn't caused by panicking in DoContext")
+	}
+}
+
+// fn calling runtime.Goexit() cannot be signaled across goroutines, so a
+// DoChanContext reader can never get the exact event — but it must still be
+// unblocked with an error instead of hanging forever, since the whole point
+// of the context variant is a bounded wait.
+func TestGoexitDoChanContextDoesNotHangForever(t *testing.T) {
+	var g Group[string, int]
+
+	ch := g.DoChanContext(context.Background(), "key", func(ctx context.Context) (int, error) {
+		runtime.Goexit()
+		return 0, nil
+	})
+
+	select {
+	case res := <-ch:
+		if res.Err == nil {
+			t.Errorf("expected a non-nil Err after fn called runtime.Goexit(), got %+v", res)
+		}
+		if res.Value.Valid {
+			t.Errorf("a Goexit call should not report a Valid zero value: %+v", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DoChanContext hangs forever after fn called runtime.Goexit()")
+	}
+}
+
+// Shared must reflect who is *currently* attached, not how many callers
+// ever joined: once every other caller has left early, the sole remaining
+// caller was not shared with anyone by the time it received the value.
+func TestDoContextSoleSurvivorReportsNotShared(t *testing.T) {
+	var g Group[string, int]
+
+	fnStarted := make(chan struct{})
+	unblockFn := make(chan struct{})
+
+	leaderDone := make(chan struct{})
+	var sharedA bool
+	go func() {
+		defer close(leaderDone)
+		_, _, sharedA = g.DoContext(context.Background(), "key", func(ctx context.Context) (int, error) {
+			close(fnStarted)
+			<-unblockFn
+			return 42, nil
+		})
+	}()
+	<-fnStarted
+
+	// B joins, then times out and leaves long before fn returns: it never
+	// receives the value.
+	joinerCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, errB, sharedB := g.DoContext(joinerCtx, "key", func(ctx context.Context) (int, error) {
+		t.Error("fn should not be invoked again for a joining caller")
+		return 0, nil
+	})
+	if !errors.Is(errB, context.DeadlineExceeded) {
+		t.Errorf("expected DeadlineExceeded, got %v", errB)
+	}
+	if !sharedB {
+		t.Errorf("expected sharedB=true, the leader was still attached when B left")
+	}
+
+	close(unblockFn)
+	<-leaderDone
+
+	if sharedA {
+		t.Errorf("expected sharedA=false: B left early and never received the value, so A was alone by the time fn returned")
+	}
 }

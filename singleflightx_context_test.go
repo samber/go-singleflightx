@@ -68,11 +68,10 @@ func TestDoChanXContext(t *testing.T) {
 	}
 }
 
-// A key repeated 3+ times in one DoChanXContext call used to register the
-// same capacity-1 result channel more than once, so the second send would
-// block forever once the caller had already drained the first value --
-// while Group.mu was held, wedging every other call on the Group. Mirrors
-// TestDoChanXDuplicateKeyDoesNotDeadlockGroup, but through the context variant.
+// A key repeated 3+ times in one DoChanXContext call must still register
+// its capacity-1 result channel exactly once: a second send into an
+// already-full channel would block forever while Group.mu is held, wedging
+// every other call on the Group.
 func TestDoChanXContextDuplicateKeyDoesNotDeadlockGroup(t *testing.T) {
 	var g Group[string, int]
 
@@ -98,6 +97,42 @@ func TestDoChanXContextDuplicateKeyDoesNotDeadlockGroup(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("Group.mu is wedged: an unrelated Do never returned")
+	}
+}
+
+// The already-canceled-ctx fast path builds one channel per key up front
+// and sends into it without ever going through startOrJoinContextX, so it
+// needs its own dedup: a repeated key must still map to exactly one
+// capacity-1 channel, or the second send blocks forever with nothing left
+// to drain it.
+func TestDoChanXContextDuplicateKeyAlreadyCanceledDoesNotHang(t *testing.T) {
+	var g Group[string, int]
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	var chans map[string]chan Result[int]
+	go func() {
+		defer close(done)
+		chans = g.DoChanXContext(ctx, []string{"a", "a", "a"}, func(ctx context.Context, keys []string) (map[string]int, error) {
+			t.Error("fn should not have been invoked")
+			return nil, nil
+		})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("DoChanXContext hangs on a duplicate key with an already-canceled ctx")
+	}
+
+	if len(chans) != 1 {
+		t.Fatalf("len(chans) = %d; want 1", len(chans))
+	}
+	res := <-chans["a"]
+	if !errors.Is(res.Err, context.Canceled) {
+		t.Errorf("chans[%q].Err = %v; want context.Canceled", "a", res.Err)
 	}
 }
 
@@ -195,7 +230,7 @@ func TestDoXContextPartialTimeout(t *testing.T) {
 	<-aDone
 }
 
-// Mirrors TestPanicDoX, but through DoXContext.
+// A panic in fn is re-raised by every caller still attached when it occurs.
 func TestPanicDoXContext(t *testing.T) {
 	var g Group[string, int]
 	fn := func(ctx context.Context, keys []string) (map[string]int, error) {
@@ -307,4 +342,60 @@ func TestShardedGroupDoContext(t *testing.T) {
 	if res.Value.Value != "baz" || res.Err != nil {
 		t.Errorf("DoChanContext result = %+v; want baz, nil", res)
 	}
+}
+
+// A panic on one key of a batch must not skip leave() on another key that
+// happens to share the same iteration, even though extracting the panicking
+// key's result (via take()) unwinds the caller's goroutine. Otherwise an
+// unrelated call sharing this batch's calls map would have its join() left
+// permanently unbalanced, leaking a waiter it can never free.
+func TestDoXContextPanicOnOneKeyStillLeavesOthers(t *testing.T) {
+	var g Group[string, int]
+
+	// "stuck" is a separate, unrelated call that outlives this whole test
+	// until explicitly unblocked at the end.
+	stuckStarted := make(chan struct{})
+	stuckUnblock := make(chan struct{})
+	stuckDone := make(chan struct{})
+	go func() {
+		defer close(stuckDone)
+		g.DoContext(context.Background(), "stuck", func(ctx context.Context) (int, error) { //nolint:errcheck
+			close(stuckStarted)
+			<-stuckUnblock
+			return 1, nil
+		})
+	}()
+	<-stuckStarted
+
+	// The batch's own ctx expires well before "stuck" ever resolves, so
+	// waitResult's ctx.Done() branch is what detaches this batch from
+	// "stuck" -- not a normal completion.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Error("expected DoXContext to re-panic for the \"panicky\" key")
+			}
+		}()
+		g.DoXContext(ctx, []string{"stuck", "panicky"}, func(ctx context.Context, keys []string) (map[string]int, error) {
+			panic("boom")
+		})
+		t.Error("DoXContext should not return normally")
+	}()
+
+	g.mu.Lock()
+	c, ok := g.m["stuck"]
+	waiters := -1
+	if ok {
+		waiters = c.waiters
+	}
+	g.mu.Unlock()
+	if !ok || waiters != 1 {
+		t.Errorf(`g.m["stuck"].waiters = %d (present=%v); want 1 (only the original caller left attached)`, waiters, ok)
+	}
+
+	close(stuckUnblock)
+	<-stuckDone
 }

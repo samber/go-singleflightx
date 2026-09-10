@@ -186,10 +186,10 @@ func TestDoChanX(t *testing.T) {
 	assert.Len(t, g.m, 0)
 }
 
-// A key repeated 3+ times in one DoChanX call used to register the same
-// capacity-1 result channel more than once, so the second send would block
-// forever once the caller had already drained the first value -- while
-// Group.mu was held, wedging every other call on the Group.
+// A key repeated 3+ times in one DoChanX call must still register its
+// capacity-1 result channel exactly once: a second send into an already-full
+// channel would block forever while Group.mu is held, wedging every other
+// call on the Group.
 func TestDoChanXDuplicateKeyDoesNotDeadlockGroup(t *testing.T) {
 	var g Group[string, int]
 

@@ -39,10 +39,9 @@ type call[V any] struct {
 	absent bool
 	err    error
 
-	// These fields are read and written with the singleflight
-	// mutex held before done is closed, and are read but
+	// This field is read and written with the singleflight
+	// mutex held before done is closed, and is read but
 	// not written after done is closed.
-	dups  int
 	chans []chan<- Result[V]
 
 	// cc is non-nil when this call was started by a XxxContext variant. It
@@ -56,6 +55,16 @@ type call[V any] struct {
 	// (and its shared callCtx) alive past every other caller's timeout: see
 	// leave. Guarded by Group.mu.
 	waiters int
+
+	// hasPlainChan is true once a plain (non-context) DoChan/DoChanX caller
+	// has ever registered a channel on this call, even if the call itself
+	// was started by a XxxContext variant (cc != nil). A plain channel
+	// caller has no per-caller way to re-raise a panic the way Do/DoX/
+	// DoContext/DoXContext callers do via take() — it can only ever see
+	// what doCall/doCallX push into its channel — so it alone decides
+	// whether an unrecovered panic must still crash the process. Guarded
+	// by Group.mu.
+	hasPlainChan bool
 }
 
 // join registers one more caller on a call, mirroring what happens when the
@@ -78,8 +87,10 @@ func (c *call[V]) join() {
 // ok is false when the call already completed — checked under Group.mu, the
 // same lock doCall/doCallX hold while closing c.done — in which case the
 // caller must use the real result instead of treating this as an early exit.
-// dups is only meaningful when ok is true.
-func (g *Group[K, V]) leave(key K, c *call[V], ch chan Result[V]) (ok bool, dups int) {
+// waiters (only meaningful when ok is true) is the count of callers still
+// attached after this one has detached, i.e. it already excludes the
+// caller that just left.
+func (g *Group[K, V]) leave(key K, c *call[V], ch chan Result[V]) (ok bool, waiters int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -110,18 +121,22 @@ func (g *Group[K, V]) leave(key K, c *call[V], ch chan Result[V]) (ok bool, dups
 		}
 	}
 
-	return true, c.dups
+	return true, c.waiters
 }
 
 // take reads the result of a completed call, re-raising a panic or
 // runtime.Goexit exactly as fn triggered it, once per blocking caller.
+//
+// Unlike leave, take doesn't detach the calling caller from c, so waiters
+// still counts it: shared is waiters > 1, i.e. "is anyone *else* still
+// attached", not just waiters > 0.
 func (c *call[V]) take() (v V, err error, shared bool) {
 	if e, ok := c.err.(*panicError); ok {
 		panic(e)
 	} else if c.err == errGoexit {
 		runtime.Goexit()
 	}
-	return c.value, c.err, c.dups > 0
+	return c.value, c.err, c.waiters > 1
 }
 
 // takeResult is like take but shaped for the batch (X) variants, which

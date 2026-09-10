@@ -42,7 +42,6 @@ func (g *Group[K, V]) startOrJoinContext(ctx context.Context, key K, ch chan Res
 		g.m = make(map[K]*call[V])
 	}
 	if c, ok := g.m[key]; ok {
-		c.dups++
 		c.join()
 		if ch != nil {
 			c.chans = append(c.chans, ch)
@@ -61,19 +60,38 @@ func (g *Group[K, V]) startOrJoinContext(ctx context.Context, key K, ch chan Res
 }
 
 // awaitResult waits for c to complete or ctx to expire, whichever comes
-// first, detaching the caller from c in the latter case. Shared by the
-// single-key and batch (X) blocking variants.
+// first, detaching the caller from c in the latter case. Used by the
+// single-key blocking variant; the batch (X) variant uses waitResult
+// directly so a panic on one key can't skip leave() on another.
 func (g *Group[K, V]) awaitResult(ctx context.Context, key K, c *call[V]) Result[V] {
+	if left, res := g.waitResult(ctx, key, c); left {
+		return res
+	}
+	return c.takeResult()
+}
+
+// waitResult waits for c to complete or ctx to expire, whichever comes
+// first, detaching the caller from c in the latter case, but — unlike
+// awaitResult — never reads c's outcome. left reports whether ctx won the
+// race (res is then the ctx-error Result to use); when left is false, the
+// caller must still extract the real result itself via take()/takeResult().
+//
+// Splitting the wait from the extraction matters for a batch: take() can
+// panic or call runtime.Goexit(), which would otherwise unwind a caller
+// mid-loop over several keys before every key's join() had a matching
+// leave(), leaking this caller's attachment on whichever keys the loop
+// hadn't reached yet.
+func (g *Group[K, V]) waitResult(ctx context.Context, key K, c *call[V]) (left bool, res Result[V]) {
 	select {
 	case <-c.done:
-		return c.takeResult()
+		return false, Result[V]{}
 	case <-ctx.Done():
-		if ok, dups := g.leave(key, c, nil); ok {
-			return Result[V]{Err: context.Cause(ctx), Shared: dups > 0}
+		if ok, waiters := g.leave(key, c, nil); ok {
+			return true, Result[V]{Err: context.Cause(ctx), Shared: waiters > 0}
 		}
 		// The call completed in the race between both select cases: use the
 		// real result instead of ctx's error.
-		return c.takeResult()
+		return false, Result[V]{}
 	}
 }
 
@@ -109,8 +127,8 @@ func (g *Group[K, V]) watchContext(ctx context.Context, key K, c *call[V], ch ch
 		// The real result was already, or will be, pushed to ch by doCall's
 		// teardown, since we never left the call.
 	case <-ctx.Done():
-		if ok, dups := g.leave(key, c, ch); ok {
-			ch <- Result[V]{Err: context.Cause(ctx), Shared: dups > 0}
+		if ok, waiters := g.leave(key, c, ch); ok {
+			ch <- Result[V]{Err: context.Cause(ctx), Shared: waiters > 0}
 		}
 	}
 }

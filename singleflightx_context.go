@@ -25,8 +25,21 @@ func (g *Group[K, V]) DoXContext(ctx context.Context, keys []K, fn func(context.
 		go g.doCallX(calls, toCall, func(keys []K) (map[K]V, error) { return fn(cc.ctx, keys) })
 	}
 
+	// Wait on every key before extracting any of them: take() (called
+	// below) can panic or call runtime.Goexit() for a key whose fn failed
+	// that way, which would otherwise unwind this loop before later keys —
+	// possibly sharing an unrelated, still in-flight call — got their
+	// waitResult/leave() call. See waitResult's doc comment.
+	toExtract := make(map[K]*call[V], len(calls))
 	for k, c := range calls {
-		results[k] = g.awaitResult(ctx, k, c)
+		if left, res := g.waitResult(ctx, k, c); left {
+			results[k] = res
+		} else {
+			toExtract[k] = c
+		}
+	}
+	for k, c := range toExtract {
+		results[k] = c.takeResult()
 	}
 
 	return results
@@ -49,7 +62,6 @@ func (g *Group[K, V]) startOrJoinContextX(ctx context.Context, keys []K, chans m
 	}
 	for _, k := range keys {
 		if c, ok := g.m[k]; ok {
-			c.dups++
 			c.join()
 			if chans != nil {
 				c.chans = append(c.chans, chans[k])
@@ -85,6 +97,12 @@ func (g *Group[K, V]) startOrJoinContextX(ctx context.Context, keys []K, chans m
 //
 // The returned channels will not be closed.
 func (g *Group[K, V]) DoChanXContext(ctx context.Context, keys []K, fn func(context.Context, []K) (map[K]V, error)) map[K]chan Result[V] {
+	// Dedupe before allocating channels: a repeated key must map to exactly
+	// one capacity-1 channel, or the ctx-already-done fast path below would
+	// send into the same channel more than once and block forever on the
+	// second send (see startOrJoinContextX, which needs the same dedup for
+	// the non-fast-path case).
+	keys = uniqKeys(keys)
 	results := make(map[K]chan Result[V], len(keys))
 	for _, k := range keys {
 		results[k] = make(chan Result[V], 1)

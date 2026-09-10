@@ -17,7 +17,10 @@ func (sg *ShardedGroup[K, V]) DoChanContext(ctx context.Context, key K, fn func(
 }
 
 // DoXContext routes keys to their shards, calling fn once per shard they
-// span. See Group.DoXContext.
+// span, and reports each key's result the same way Group.DoXContext does —
+// except a panic or runtime.Goexit in fn is always delivered as a Result
+// here (as DoChanXContext already does), never re-raised in the caller's own
+// goroutine, since this method is built on the channel-based DoChanXContext.
 func (sg *ShardedGroup[K, V]) DoXContext(ctx context.Context, keys []K, fn func(context.Context, []K) (map[K]V, error)) map[K]Result[V] {
 	ch := sg.DoChanXContext(ctx, keys, fn)
 
