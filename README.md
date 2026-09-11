@@ -33,7 +33,9 @@ This library is inspired by `x/sync/singleflight` but adds many features:
 go get github.com/samber/go-singleflightx
 ```
 
-This library is v0 and follows SemVer strictly. No breaking changes will be made to exported APIs before v1.0.0.
+This library is v1 and follows SemVer strictly.
+
+No breaking changes will be made to exported APIs before v2.0.0.
 
 ## 💡 Doc
 
