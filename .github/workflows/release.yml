@@ -12,8 +12,6 @@ jobs:
   release:
     if: github.triggering_actor == 'samber'
     runs-on: ubuntu-latest
-    # The default GITHUB_TOKEN is read-only: pushing the release tag and
-    # creating the GitHub release both need contents write access.
     permissions:
       contents: write
     steps:
