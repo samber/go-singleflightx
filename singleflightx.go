@@ -10,6 +10,7 @@ import "runtime"
 // Even if fn does not return V on some keys, the results map will contain
 // those keys with a `Valid` field set to false.
 func (g *Group[K, V]) DoX(keys []K, fn func([]K) (map[K]V, error)) (results map[K]Result[V]) {
+	keys = uniqKeys(keys)
 	results = make(map[K]Result[V], len(keys))
 	calls := make(map[K]*call[V], len(keys))
 	toCall := []K{}
@@ -20,11 +21,11 @@ func (g *Group[K, V]) DoX(keys []K, fn func([]K) (map[K]V, error)) (results map[
 	}
 	for _, k := range keys {
 		if c, ok := g.m[k]; ok {
-			c.dups++
+			c.join()
 			calls[k] = c
 		} else {
-			c := new(call[V])
-			c.wg.Add(1)
+			c := &call[V]{done: make(chan struct{})}
+			c.join()
 			g.m[k] = c
 			calls[k] = c
 			toCall = append(toCall, k)
@@ -35,7 +36,7 @@ func (g *Group[K, V]) DoX(keys []K, fn func([]K) (map[K]V, error)) (results map[
 	g.doCallX(calls, toCall, fn)
 
 	for k, c := range calls {
-		c.wg.Wait()
+		<-c.done
 
 		if e, ok := c.err.(*panicError); ok {
 			panic(e)
@@ -43,7 +44,10 @@ func (g *Group[K, V]) DoX(keys []K, fn func([]K) (map[K]V, error)) (results map[
 			runtime.Goexit()
 		}
 
-		results[k] = Result[V]{NullValue[V]{c.value, !c.absent}, c.err, c.dups > 0}
+		// waiters > 1, not just > 0: this caller is itself still counted in
+		// waiters (it hasn't detached), so >1 asks whether anyone *else* is
+		// also currently attached to have received this same value.
+		results[k] = Result[V]{NullValue[V]{c.value, !c.absent}, c.err, c.waiters > 1}
 	}
 
 	return results
@@ -54,6 +58,7 @@ func (g *Group[K, V]) DoX(keys []K, fn func([]K) (map[K]V, error)) (results map[
 //
 // The returned channel will not be closed.
 func (g *Group[K, V]) DoChanX(keys []K, fn func([]K) (map[K]V, error)) map[K]chan Result[V] {
+	keys = uniqKeys(keys)
 	results := make(map[K]chan Result[V], len(keys))
 	for _, k := range keys {
 		results[k] = make(chan Result[V], 1)
@@ -68,12 +73,13 @@ func (g *Group[K, V]) DoChanX(keys []K, fn func([]K) (map[K]V, error)) map[K]cha
 	}
 	for _, k := range keys {
 		if c, ok := g.m[k]; ok {
-			c.dups++
+			c.join()
 			c.chans = append(g.m[k].chans, results[k])
+			c.hasPlainChan = true
 			calls[k] = c
 		} else {
-			c := &call[V]{chans: []chan<- Result[V]{results[k]}}
-			c.wg.Add(1)
+			c := &call[V]{done: make(chan struct{}), chans: []chan<- Result[V]{results[k]}, hasPlainChan: true}
+			c.join()
 			g.m[k] = c
 			calls[k] = c
 			toCall = append(toCall, k)
@@ -102,6 +108,12 @@ func (g *Group[K, V]) doCallX(c map[K]*call[V], keys []K, fn func([]K) (map[K]V,
 		if !normalReturn && !recovered {
 			for _, key := range keys {
 				c[key].err = errGoexit
+				// A pure context-aware batch delivers this as a Result
+				// instead of leaving DoChanXContext callers blocked forever
+				// (see the finalize loop below), so absent must be set here
+				// too, or Valid would wrongly report true for the zero
+				// value fn never got to produce.
+				c[key].absent = true
 			}
 		}
 
@@ -109,12 +121,30 @@ func (g *Group[K, V]) doCallX(c map[K]*call[V], keys []K, fn func([]K) (map[K]V,
 		defer g.mu.Unlock()
 
 		for _, key := range keys {
-			c[key].wg.Done()
+			close(c[key].done)
 			if g.m[key] == c[key] {
 				delete(g.m, key)
 			}
+		}
 
-			if e, ok := c[key].err.(*panicError); ok {
+		// Every key in this batch shares the same callCtx (or none), created
+		// once by the caller before doCallX was launched.
+		cc := c[keys[0]].cc
+		if cc != nil {
+			cc.cancel(nil)
+		}
+
+		for _, key := range keys {
+			// A plain (non-context) channel caller has no per-caller way to
+			// re-raise a panic or Goexit the way DoX/DoXContext callers do
+			// via take() — it can only ever see what we push into its
+			// channel — so if one is attached to this key, its contract
+			// (crash the process on panic, hang on Goexit exactly as it
+			// always has) wins even if this batch was started by a
+			// XxxContext variant.
+			mustHonorPlainContract := cc == nil || c[key].hasPlainChan
+
+			if e, ok := c[key].err.(*panicError); ok && mustHonorPlainContract {
 				// In order to prevent the waiting channels from being blocked forever,
 				// needs to ensure that this panic cannot be recovered.
 				if len(c[key].chans) > 0 {
@@ -123,12 +153,17 @@ func (g *Group[K, V]) doCallX(c map[K]*call[V], keys []K, fn func([]K) (map[K]V,
 				} else {
 					panic(e)
 				}
-			} else if c[key].err == errGoexit {
+			} else if c[key].err == errGoexit && mustHonorPlainContract {
 				// Already in the process of goexit, no need to call again
 			} else {
-				// Normal return
+				// Normal return, or a pure context-aware key's panic/Goexit
+				// (cc != nil and no plain channel caller ever attached to
+				// this key): delivered as a plain Result instead of
+				// crashing the process or hanging, so DoXContext callers
+				// can re-panic/re-Goexit themselves and DoChanXContext
+				// callers see it in Result.Err.
 				for _, ch := range c[key].chans {
-					ch <- Result[V]{NullValue[V]{c[key].value, !c[key].absent}, c[key].err, c[key].dups > 0}
+					ch <- Result[V]{NullValue[V]{c[key].value, !c[key].absent}, c[key].err, c[key].waiters > 1}
 				}
 			}
 		}
@@ -145,8 +180,13 @@ func (g *Group[K, V]) doCallX(c map[K]*call[V], keys []K, fn func([]K) (map[K]V,
 				// the time we know that, the part of the stack trace relevant to the
 				// panic has been discarded.
 				if r := recover(); r != nil {
+					// A context-aware batch delivers this as a Result instead of
+					// crashing the process (see the finalize defer below), so
+					// absent must be set here too, or Valid would wrongly report
+					// true for the zero value fn never got to produce.
 					for _, key := range keys {
 						c[key].err = newPanicError(r)
+						c[key].absent = true
 					}
 				}
 			}

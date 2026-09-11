@@ -46,23 +46,6 @@ func newPanicError(v interface{}) error {
 	return &panicError{value: v, stack: stack}
 }
 
-// call is an in-flight or completed singleflight.Do call
-type call[V any] struct {
-	wg sync.WaitGroup
-
-	// These fields are written once before the WaitGroup is done
-	// and are only read after the WaitGroup is done.
-	value  V
-	absent bool
-	err    error
-
-	// These fields are read and written with the singleflight
-	// mutex held before the WaitGroup is done, and are read but
-	// not written after the WaitGroup is done.
-	dups  int
-	chans []chan<- Result[V]
-}
-
 // Group represents a class of work and forms a namespace in
 // which units of work can be executed with duplicate suppression.
 type Group[K comparable, V any] struct {
@@ -95,24 +78,27 @@ func (g *Group[K, V]) Do(key K, fn func() (V, error)) (v V, err error, shared bo
 		g.m = make(map[K]*call[V])
 	}
 	if c, ok := g.m[key]; ok {
-		c.dups++
+		c.join()
 		g.mu.Unlock()
-		c.wg.Wait()
+		<-c.done
 
 		if e, ok := c.err.(*panicError); ok {
 			panic(e)
 		} else if c.err == errGoexit {
 			runtime.Goexit()
 		}
-		return c.value, c.err, true
+		// waiters > 1, not just > 0: this caller is itself still counted in
+		// waiters (it hasn't detached), so >1 asks whether anyone *else* is
+		// also currently attached to have received this same value.
+		return c.value, c.err, c.waiters > 1
 	}
-	c := new(call[V])
-	c.wg.Add(1)
+	c := &call[V]{done: make(chan struct{})}
+	c.join()
 	g.m[key] = c
 	g.mu.Unlock()
 
 	g.doCall(c, key, fn)
-	return c.value, c.err, c.dups > 0
+	return c.value, c.err, c.waiters > 1
 }
 
 // DoChan is like Do but returns a channel that will receive the
@@ -126,13 +112,14 @@ func (g *Group[K, V]) DoChan(key K, fn func() (V, error)) <-chan Result[V] {
 		g.m = make(map[K]*call[V])
 	}
 	if c, ok := g.m[key]; ok {
-		c.dups++
+		c.join()
 		c.chans = append(c.chans, ch)
+		c.hasPlainChan = true
 		g.mu.Unlock()
 		return ch
 	}
-	c := &call[V]{chans: []chan<- Result[V]{ch}}
-	c.wg.Add(1)
+	c := &call[V]{done: make(chan struct{}), chans: []chan<- Result[V]{ch}, hasPlainChan: true}
+	c.join()
 	g.m[key] = c
 	g.mu.Unlock()
 
@@ -152,16 +139,33 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 		// the given function invoked runtime.Goexit
 		if !normalReturn && !recovered {
 			c.err = errGoexit
+			// A pure context-aware call delivers this as a Result instead
+			// of leaving a DoChanContext caller blocked forever (see the
+			// finalize defer below), so absent must be set here too, or
+			// Valid would wrongly report true for the zero value fn never
+			// got to produce.
+			c.absent = true
 		}
 
 		g.mu.Lock()
 		defer g.mu.Unlock()
-		c.wg.Done()
+		close(c.done)
 		if g.m[key] == c {
 			delete(g.m, key)
 		}
+		if c.cc != nil {
+			c.cc.cancel(nil)
+		}
 
-		if e, ok := c.err.(*panicError); ok {
+		// A plain (non-context) channel caller has no per-caller way to
+		// re-raise a panic or Goexit the way Do/DoContext callers do via
+		// take() — it can only ever see what we push into its channel — so
+		// if one is attached, its contract (crash the process on panic,
+		// hang on Goexit exactly as it always has) wins even if this call
+		// was started by a XxxContext variant.
+		mustHonorPlainContract := c.cc == nil || c.hasPlainChan
+
+		if e, ok := c.err.(*panicError); ok && mustHonorPlainContract {
 			// In order to prevent the waiting channels from being blocked forever,
 			// needs to ensure that this panic cannot be recovered.
 			if len(c.chans) > 0 {
@@ -170,12 +174,16 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 			} else {
 				panic(e)
 			}
-		} else if c.err == errGoexit {
+		} else if c.err == errGoexit && mustHonorPlainContract {
 			// Already in the process of goexit, no need to call again
 		} else {
-			// Normal return
+			// Normal return, or a pure context-aware call's panic/Goexit
+			// (c.cc != nil and no plain channel caller ever attached):
+			// delivered as a plain Result instead of crashing the process or
+			// hanging, so a DoContext caller can re-panic/re-Goexit itself
+			// and a DoChanContext caller sees it in Result.Err.
 			for _, ch := range c.chans {
-				ch <- Result[V]{NullValue[V]{c.value, !c.absent}, c.err, c.dups > 0}
+				ch <- Result[V]{NullValue[V]{c.value, !c.absent}, c.err, c.waiters > 1}
 			}
 		}
 	}()
@@ -192,6 +200,11 @@ func (g *Group[K, V]) doCall(c *call[V], key K, fn func() (V, error)) {
 				// panic has been discarded.
 				if r := recover(); r != nil {
 					c.err = newPanicError(r)
+					// A context-aware call delivers this as a Result instead of
+					// crashing the process (see the finalize defer below), so
+					// absent must be set here too, or Valid would wrongly report
+					// true for the zero value fn never got to produce.
+					c.absent = true
 				}
 			}
 		}()
